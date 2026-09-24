@@ -2,13 +2,17 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { NotificationOrmEntity } from './notification.orm-entity';
+import { DeviceTokenOrmEntity } from './device-token.orm-entity';
 import { CreateNotificationDto } from './create-notification.dto';
+import { RegisterDeviceTokenDto } from './register-device-token.dto';
+import { FcmService } from './fcm.service';
 
 /**
- * Stub notification dispatcher: persists the notification and logs it instead of
- * calling Firebase Cloud Messaging. Swap `dispatch()`'s logging line for a real
- * firebase-admin `send()` call once a Firebase project/service account is available —
- * the REST contract (create/list/mark-as-read) stays the same either way.
+ * Persists every notification (so the app's in-app Alerts list always has a
+ * history to show) and, when a device token is on file and Firebase is
+ * configured, also pushes it — a real OS-level notification even if the app
+ * is closed. Without Firebase configured, dispatch() still works exactly as
+ * before: persisted + logged, no push.
  */
 @Injectable()
 export class NotificationService {
@@ -17,6 +21,9 @@ export class NotificationService {
     constructor(
         @InjectRepository(NotificationOrmEntity)
         private readonly repo: Repository<NotificationOrmEntity>,
+        @InjectRepository(DeviceTokenOrmEntity)
+        private readonly deviceTokenRepo: Repository<DeviceTokenOrmEntity>,
+        private readonly fcm: FcmService,
     ) {}
 
     async dispatch(dto: CreateNotificationDto): Promise<NotificationOrmEntity> {
@@ -27,8 +34,27 @@ export class NotificationService {
             isRead: false,
         });
         const saved = await this.repo.save(notification);
-        this.logger.log(`[STUB PUSH] would send FCM notification to user ${dto.userId}: "${dto.title}"`);
+
+        const device = await this.deviceTokenRepo.findOne({ where: { userId: dto.userId } });
+        if (!device) {
+            this.logger.log(`[NO DEVICE] user ${dto.userId} has no registered device — in-app only: "${dto.title}"`);
+            return saved;
+        }
+
+        const result = await this.fcm.send(device.fcmToken, dto.title, dto.message);
+        if (result === 'stubbed') {
+            this.logger.log(`[STUB PUSH] would send FCM notification to user ${dto.userId}: "${dto.title}"`);
+        } else if (result === 'invalid-token') {
+            this.logger.warn(`Device token for user ${dto.userId} is no longer valid — removing it.`);
+            await this.deviceTokenRepo.delete({ userId: dto.userId });
+        }
+
         return saved;
+    }
+
+    /** Called by the mobile app right after login (and on token refresh). */
+    async registerDeviceToken(dto: RegisterDeviceTokenDto): Promise<void> {
+        await this.deviceTokenRepo.save({ userId: dto.userId, fcmToken: dto.fcmToken });
     }
 
     findAllForUser(userId: string): Promise<NotificationOrmEntity[]> {
